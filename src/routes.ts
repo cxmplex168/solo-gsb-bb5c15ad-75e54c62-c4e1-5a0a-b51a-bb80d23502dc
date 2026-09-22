@@ -1,5 +1,5 @@
 import { FastifyInstance } from 'fastify';
-import { CacheStore, RevalidationConflictError } from './db';
+import { CacheStore, InvalidationResult, RevalidationConflictError } from './db';
 import {
   computeCacheKey,
   normalizeUrl,
@@ -40,6 +40,18 @@ interface StoreEntryPayload {
   vary?: unknown;
 }
 
+interface InvalidatePayload {
+  method?: unknown;
+  url?: unknown;
+  headers?: unknown;
+  requestHeaders?: unknown;
+  expectedEtag?: unknown;
+  etag?: unknown;
+  dryRun?: unknown;
+  reason?: unknown;
+  requestId?: unknown;
+}
+
 export default function registerRoutes(app: FastifyInstance, store: CacheStore): void {
   // —— 基础信息 ——
   app.get('/', async () => ({
@@ -57,6 +69,8 @@ export default function registerRoutes(app: FastifyInstance, store: CacheStore):
       'GET  /cache/stats': '计数',
       'POST /admin/entries': '预置模拟响应',
       'DELETE /admin/entries/:cacheKey': '删除单个条目',
+      'POST /admin/invalidate': '按方法+URL+Vary 请求头条件失效（ETag 守卫，支持 dryRun）',
+      'GET  /admin/invalidations': '查看条件失效审计记录',
       'POST /admin/reset': '清空所有数据并重置实例',
       'GET  /healthz': '健康检查',
     },
@@ -494,6 +508,82 @@ export default function registerRoutes(app: FastifyInstance, store: CacheStore):
     return reply.code(200).send({ deleted: true, cacheKey });
   });
 
+  // —— 管理：条件失效（方法 + 规范化 URL + Vary 请求头精确解析变体，ETag 守卫）——
+  app.post('/admin/invalidate', async (req, reply) => {
+    const body = (req.body ?? {}) as InvalidatePayload;
+
+    const requestId =
+      asOptionalString(body.requestId, 'requestId') ?? generateRequestId('inv');
+
+    const method = (asOptionalString(body.method, 'method') ?? 'GET').toUpperCase();
+    if (!/^[A-Z]+$/.test(method)) throw new ValidationError('method 必须是 HTTP 方法 token');
+    // 与缓存请求一致：HEAD 与 GET 共享存储，失效也按 GET 键定位
+    const keyMethod = method === 'HEAD' ? 'GET' : method;
+
+    const url = asRequiredString(body.url, 'url');
+    const normalized = normalizeUrl(url);
+    // 仅用与 Vary 解析相关的请求头定位变体；cache-control 等请求指令不影响键
+    const requestHeaders = normalizeHeaders(body.requestHeaders ?? body.headers);
+
+    const expectedRaw = asOptionalString(
+      body.expectedEtag ?? (body.etag as unknown),
+      'expectedEtag'
+    );
+    const expectedEtag = expectedRaw === undefined ? null : normalizeEtag(expectedRaw);
+
+    const reason = asOptionalString(body.reason, 'reason') ?? null;
+    const dryRun = asBoolean(body.dryRun, 'dryRun');
+
+    const result = store.invalidate({
+      requestId,
+      method: keyMethod,
+      normalizedUrl: normalized.normalized,
+      requestHeaders,
+      expectedEtag,
+      reason,
+      dryRun,
+      now: Date.now(),
+    });
+
+    const messages: Record<InvalidationResult['outcome'], string> = {
+      invalidated: '条件失效完成：匹配条目已从事务中删除，其 pending 回源令牌已释放',
+      preview:
+        'dryRun 预览：未修改任何数据；下列条目在正式执行时会被删除，对应 pending 令牌会被释放',
+      noop: '没有符合条件的条目：未删除任何缓存条目，未释放任何令牌',
+    };
+
+    return reply.code(200).send({
+      requestId: result.requestId,
+      recordId: result.id,
+      dryRun: result.dryRun,
+      outcome: result.outcome,
+      target: {
+        method,
+        keyMethod: method === keyMethod ? undefined : keyMethod,
+        url,
+        normalizedUrl: normalized.normalized,
+        requestHeaders,
+        expectedEtag,
+      },
+      affected: result.affected,
+      skipped: result.skipped,
+      releasedTokens: result.tokens.map((t) => ({
+        token: t.token,
+        tokenPrefix: t.token.slice(0, 16),
+        etag: t.etag,
+        disposition: t.disposition,
+      })),
+      counts: result.counts,
+      recordEndpoint: 'GET /admin/invalidations',
+      message: messages[result.outcome],
+    });
+  });
+
+  app.get('/admin/invalidations', async (req) => {
+    const q = req.query as { limit?: string };
+    return { invalidations: store.listInvalidationRecords(clampLimit(q.limit)) };
+  });
+
   // —— 重置 ——
   app.post('/admin/reset', async () => {
     store.reset();
@@ -662,6 +752,21 @@ function asStatus(value: unknown): number {
     throw new ValidationError('status 必须是 100-599 的整数');
   }
   return value;
+}
+
+function asBoolean(value: unknown, field: string): boolean {
+  if (value === undefined || value === null) return false;
+  if (typeof value === 'boolean') return value;
+  throw new ValidationError(`${field} 必须是布尔值`);
+}
+
+/**
+ * 规整 expectedEtag：与预置接口一致，裸值（如 v1）自动补双引号；
+ * 已是合法 entity-tag（"…" 或 W/"…"）则原样保留。
+ */
+function normalizeEtag(raw: string): string {
+  if (raw.startsWith('"') || raw.startsWith('W/')) return raw;
+  return `"${raw}"`;
 }
 
 function clampLimit(value: string | undefined): number {

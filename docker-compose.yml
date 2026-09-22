@@ -26,5 +26,23 @@ services:
       retries: 5
       start_period: 5s
 
+  # 端到端示例：在一次性容器里以内存库跑全部冒烟断言（含条件失效 dryRun /
+  # ETag 守卫 / pending 令牌释放 / 审计记录），跑完即退出，不挂载数据卷。
+  #   docker compose --profile smoke run --build smoke
+  smoke:
+    profiles: ["smoke"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: http-cache-lab:latest
+    environment:
+      DB_PATH: :memory:
+      LOG_LEVEL: error
+    # 运行时镜像只保留生产依赖与编译产物；冒烟脚本随 dist 一并发布，
+    # 直接用 node 执行编译后的版本即可，无需 ts-node / devDependencies。
+    entrypoint: ["node"]
+    command: ["dist/scripts/smoke.js"]
+    restart: "no"
+
 volumes:
   cache-lab-data:

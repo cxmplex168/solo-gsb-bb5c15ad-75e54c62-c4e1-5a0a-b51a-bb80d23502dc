@@ -2,7 +2,8 @@ import Database, { Database as DB } from 'better-sqlite3';
 import { randomUUID } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
-import { EntryRow, HeaderMap, TokenRow } from './types';
+import { computeCacheKey, selectVaryHeaders } from './canonical';
+import { EntryRow, HeaderMap, InvalidationRecordRow, TokenRow } from './types';
 import { generateToken, sha256, stableStringify } from './util';
 
 export interface NewEntry {
@@ -30,6 +31,58 @@ export interface ApplyRevalidationResult {
   idempotentReplay: boolean;
   conflict?: string;
   entry?: EntryRow;
+}
+
+/** 条件失效的定位输入（method/URL 已规范化，Vary 选择值由 requestHeaders 决定） */
+export interface InvalidationInput {
+  requestId: string;
+  method: string;
+  normalizedUrl: string;
+  requestHeaders: HeaderMap;
+  expectedEtag: string | null;
+  reason: string | null;
+  dryRun: boolean;
+  now: number;
+}
+
+/** 实际/将要被删除的条目 */
+export interface InvalidationAffected {
+  cacheKey: string;
+  method: string;
+  normalizedUrl: string;
+  etag: string | null;
+  vary: string[];
+  varySelectors: Array<{ name: string; value: string | null }>;
+  disposition: 'deleted' | 'would-delete';
+}
+
+/** 同 URL 下未被删除的候选条目及原因 */
+export interface InvalidationSkipped {
+  cacheKey: string;
+  etag: string | null;
+  /** etag-mismatch=变体精确命中但 ETag 不符；variant-not-selected=Vary 选择值对应另一个变体 */
+  reason: 'etag-mismatch' | 'variant-not-selected';
+  detail: string;
+}
+
+/** 随失效释放的 pending 回源令牌 */
+export interface InvalidationToken {
+  token: string;
+  etag: string | null;
+  disposition: 'released' | 'would-release';
+}
+
+export interface InvalidationResult {
+  id: number;
+  requestId: string;
+  dryRun: boolean;
+  /** invalidated=实际删除；preview=演练模式有待删项；noop=没有可删项 */
+  outcome: 'invalidated' | 'preview' | 'noop';
+  affected: InvalidationAffected[];
+  skipped: InvalidationSkipped[];
+  tokens: InvalidationToken[];
+  counts: { deletedEntries: number; releasedTokens: number };
+  wallTime: number;
 }
 
 export class CacheStore {
@@ -98,6 +151,25 @@ export class CacheStore {
         trail_json     TEXT NOT NULL,
         wall_time      INTEGER NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS invalidation_records (
+        id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+        request_id            TEXT NOT NULL,
+        dry_run               INTEGER NOT NULL,
+        method                TEXT NOT NULL,
+        normalized_url        TEXT NOT NULL,
+        request_headers_json  TEXT NOT NULL,
+        expected_etag         TEXT,
+        reason                TEXT,
+        outcome               TEXT NOT NULL,
+        affected_json         TEXT NOT NULL,
+        skipped_json          TEXT NOT NULL,
+        released_tokens_json  TEXT NOT NULL,
+        deleted_entries       INTEGER NOT NULL,
+        released_token_count  INTEGER NOT NULL,
+        wall_time             INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_invalidations_time ON invalidation_records(id DESC);
 
       CREATE TABLE IF NOT EXISTS meta (
         key   TEXT PRIMARY KEY,
@@ -461,11 +533,206 @@ export class CacheStore {
     }));
   }
 
+  // —— 条件失效 ——
+
+  /**
+   * 按「方法 + 规范化 URL」找候选条目，用每个候选自身的 Vary 集合结合请求头
+   * 精确解析目标变体（与 lookupEntry 相同的「响应头决定键」语义），随后：
+   *
+   * - 变体命中且 ETag 与 expectedEtag 相符（或未提供 expectedEtag）=> 删除条目；
+   * - 变体命中但 ETag 不符 => 跳过（etag-mismatch），绝不动其他变体；
+   * - 同 URL 的其他 Vary 变体 => 跳过（variant-not-selected）；
+   * - 删除的键上若有 pending 回源令牌 => 一并释放（status='released'），
+   *   否则同键无法签发新令牌。
+   *
+   * 整个过程在单个 IMMEDIATE 事务内完成；dryRun 只做同样的解析与判定，
+   * 不删条目、不动令牌，但同样写入一条审计记录（dry_run=1）便于追溯。
+   */
+  invalidate(input: InvalidationInput): InvalidationResult {
+    const txn = this.db.transaction((): InvalidationResult => {
+      const candidates = this.db
+        .prepare(
+          `SELECT * FROM entries
+           WHERE method = ? AND normalized_url = ?
+           ORDER BY updated_at DESC`
+        )
+        .all(input.method, input.normalizedUrl) as EntryRow[];
+
+      const affected: InvalidationAffected[] = [];
+      const skipped: InvalidationSkipped[] = [];
+      let matchedEntry: EntryRow | undefined;
+
+      for (const candidate of candidates) {
+        const varyNames = JSON.parse(candidate.vary_names) as string[];
+        const varySelectors = selectVaryHeaders(varyNames, input.requestHeaders);
+        const keyDetails = computeCacheKey({
+          method: input.method,
+          normalizedUrl: input.normalizedUrl,
+          varyNames,
+          varySelectors,
+        });
+
+        if (keyDetails.cacheKey !== candidate.cache_key) {
+          skipped.push({
+            cacheKey: candidate.cache_key,
+            etag: readEtag(candidate),
+            reason: 'variant-not-selected',
+            detail: `该条目的 Vary(${varyNames.join(',') || '∅'}) 选择值对应另一个变体，本次请求头解析出的键不指向它`,
+          });
+          continue;
+        }
+
+        // 键哈希具有唯一性，最多只有一个候选能成为目标变体
+        matchedEntry = candidate;
+        const etag = readEtag(candidate);
+        if (input.expectedEtag !== null && etag !== input.expectedEtag) {
+          skipped.push({
+            cacheKey: candidate.cache_key,
+            etag,
+            reason: 'etag-mismatch',
+            detail:
+              etag === null
+                ? `条目无 ETag，条件失效要求 expectedEtag=${input.expectedEtag}`
+                : `条目 ETag ${etag} 与 expectedEtag ${input.expectedEtag} 不符，拒绝删除`,
+          });
+          matchedEntry = undefined;
+        }
+      }
+
+      let tokens: InvalidationToken[] = [];
+      if (matchedEntry) {
+        const target = matchedEntry;
+        affected.push({
+          cacheKey: target.cache_key,
+          method: target.method,
+          normalizedUrl: target.normalized_url,
+          etag: readEtag(target),
+          vary: JSON.parse(target.vary_names),
+          varySelectors: JSON.parse(target.vary_selectors_json),
+          disposition: input.dryRun ? 'would-delete' : 'deleted',
+        });
+
+        // 先读出该键的 pending 令牌（dryRun 需要完整令牌值用于预览）
+        const pendingTokens = this.db
+          .prepare("SELECT * FROM tokens WHERE cache_key = ? AND status = 'pending'")
+          .all(target.cache_key) as TokenRow[];
+
+        if (!input.dryRun) {
+          this.db.prepare('DELETE FROM entries WHERE cache_key = ?').run(target.cache_key);
+          this.db
+            .prepare(
+              `UPDATE tokens
+                 SET status='released', consumed_at=?, result_summary='released by conditional invalidation'
+               WHERE cache_key=? AND status='pending'`
+            )
+            .run(input.now, target.cache_key);
+        }
+
+        tokens = pendingTokens.map((t) => ({
+          token: t.token,
+          etag: t.etag,
+          disposition: input.dryRun ? 'would-release' : 'released',
+        }));
+      }
+
+      const outcome: InvalidationResult['outcome'] = affected.length === 0
+        ? 'noop'
+        : input.dryRun
+          ? 'preview'
+          : 'invalidated';
+
+      const id = this.insertInvalidationRecord(input, {
+        outcome,
+        affected,
+        skipped,
+        tokens,
+      });
+
+      return {
+        id,
+        requestId: input.requestId,
+        dryRun: input.dryRun,
+        outcome,
+        affected,
+        skipped,
+        tokens,
+        counts: {
+          deletedEntries: input.dryRun ? 0 : affected.length,
+          releasedTokens: input.dryRun ? 0 : tokens.length,
+        },
+        wallTime: input.now,
+      };
+    });
+    return txn.immediate();
+  }
+
+  private insertInvalidationRecord(
+    input: InvalidationInput,
+    p: {
+      outcome: InvalidationResult['outcome'];
+      affected: InvalidationAffected[];
+      skipped: InvalidationSkipped[];
+      tokens: InvalidationToken[];
+    }
+  ): number {
+    const info = this.db
+      .prepare(
+        `INSERT INTO invalidation_records
+           (request_id, dry_run, method, normalized_url, request_headers_json,
+            expected_etag, reason, outcome, affected_json, skipped_json,
+            released_tokens_json, deleted_entries, released_token_count, wall_time)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        input.requestId,
+        input.dryRun ? 1 : 0,
+        input.method,
+        input.normalizedUrl,
+        JSON.stringify(input.requestHeaders),
+        input.expectedEtag,
+        input.reason,
+        p.outcome,
+        JSON.stringify(p.affected),
+        JSON.stringify(p.skipped),
+        JSON.stringify(p.tokens.map((t) => t.token)),
+        input.dryRun ? 0 : p.affected.length,
+        input.dryRun ? 0 : p.tokens.length,
+        input.now
+      );
+    return Number(info.lastInsertRowid);
+  }
+
+  /** 条件失效审计记录（最近在前） */
+  listInvalidationRecords(limit: number): unknown[] {
+    const rows = this.db
+      .prepare('SELECT * FROM invalidation_records ORDER BY id DESC LIMIT ?')
+      .all(limit) as InvalidationRecordRow[];
+    return rows.map((r) => ({
+      id: r.id,
+      requestId: r.request_id,
+      dryRun: r.dry_run === 1,
+      method: r.method,
+      normalizedUrl: r.normalized_url,
+      requestHeaders: JSON.parse(r.request_headers_json),
+      expectedEtag: r.expected_etag,
+      reason: r.reason,
+      outcome: r.outcome,
+      affected: JSON.parse(r.affected_json),
+      skipped: JSON.parse(r.skipped_json),
+      releasedTokens: JSON.parse(r.released_tokens_json),
+      deletedEntries: r.deleted_entries,
+      releasedTokenCount: r.released_token_count,
+      wallTime: r.wall_time,
+    }));
+  }
+
   // —— 重置 / 统计 ——
 
   reset(): void {
     this.db.transaction(() => {
-      this.db.exec('DELETE FROM entries; DELETE FROM tokens; DELETE FROM decision_logs;');
+      this.db.exec(
+        'DELETE FROM entries; DELETE FROM tokens; DELETE FROM decision_logs; DELETE FROM invalidation_records;'
+      );
       this.db
         .prepare('INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)')
         .run('instance_id', randomUUID());
@@ -490,6 +757,12 @@ function parseVaryNames(value: string | undefined): string[] {
     .filter(Boolean);
   if (tokens.includes('*')) return [];
   return [...new Set(tokens)];
+}
+
+/** 从条目响应头中读出 ETag（无 etag 头为 null） */
+function readEtag(entry: EntryRow): string | null {
+  const headers = JSON.parse(entry.response_headers) as HeaderMap;
+  return headers['etag'] !== undefined ? headers['etag'] : null;
 }
 
 export class RevalidationConflictError extends Error {

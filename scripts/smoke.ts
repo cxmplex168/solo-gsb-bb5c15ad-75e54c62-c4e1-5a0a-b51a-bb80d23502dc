@@ -340,6 +340,187 @@ async function main(): Promise<void> {
   });
   check('Vary: * 预置被拒', r.status === 400);
 
+  console.log('\n[15] 条件失效：dryRun 预览（不改动数据）');
+  await call(app, 'POST', '/admin/entries', {
+    url: 'https://origin.test/inv',
+    requestHeaders: { 'accept-encoding': 'gzip' },
+    responseHeaders: { 'cache-control': 'max-age=60', vary: 'Accept-Encoding', etag: '"g1"' },
+    body: 'gzip-body',
+    storedAt: T0,
+  });
+  await call(app, 'POST', '/admin/entries', {
+    url: 'https://origin.test/inv',
+    requestHeaders: { 'accept-encoding': 'br' },
+    responseHeaders: { 'cache-control': 'max-age=60', vary: 'Accept-Encoding', etag: '"b1"' },
+    body: 'br-body',
+    storedAt: T0,
+  });
+  r = await call(app, 'POST', '/admin/invalidate', {
+    url: 'https://origin.test/inv',
+    headers: { 'accept-encoding': 'gzip' },
+    dryRun: true,
+    reason: 'deploy-1234',
+  });
+  check('dryRun 返回 200 且带 dryRun 标志与 recordId', r.status === 200 && r.json.dryRun === true && typeof r.json.recordId === 'number');
+  check('dryRun 结果为 preview', r.json.outcome === 'preview');
+  check('affected 精确指向 gzip 变体且 disposition=would-delete',
+    r.json.affected.length === 1 && r.json.affected[0].disposition === 'would-delete' &&
+    r.json.affected[0].etag === '"g1"' && r.json.affected[0].cacheKey !== undefined);
+  check('br 变体出现在 skipped 且原因 variant-not-selected',
+    r.json.skipped.length === 1 && r.json.skipped[0].reason === 'variant-not-selected' &&
+    r.json.skipped[0].etag === '"b1"');
+  r = await call(app, 'POST', '/cache/request', {
+    url: 'https://origin.test/inv',
+    headers: { 'accept-encoding': 'gzip' },
+    virtualTime: T0,
+  });
+  check('dryRun 后 gzip 变体仍然命中', r.json.state === 'fresh' && r.json.response.body === 'gzip-body');
+
+  console.log('\n[16] 条件失效：ETag 守卫');
+  r = await call(app, 'POST', '/admin/invalidate', {
+    url: 'https://origin.test/inv',
+    requestHeaders: { 'accept-encoding': 'gzip' },
+    expectedEtag: '"stale-etag"',
+  });
+  check('ETag 不符 => noop 且跳过原因 etag-mismatch',
+    r.json.outcome === 'noop' && r.json.counts.deletedEntries === 0 &&
+    r.json.skipped.some((s: any) => s.reason === 'etag-mismatch'));
+  r = await call(app, 'POST', '/cache/request', {
+    url: 'https://origin.test/inv',
+    headers: { 'accept-encoding': 'gzip' },
+    virtualTime: T0,
+  });
+  check('ETag 不符时条目未被删除', r.json.state === 'fresh');
+  r = await call(app, 'POST', '/admin/invalidate', {
+    url: 'https://origin.test/inv',
+    requestHeaders: { 'accept-encoding': 'gzip' },
+    etag: 'g1', // 裸 ETag 自动补引号
+  });
+  check('ETag 相符 => invalidated，删除 1 条', r.json.outcome === 'invalidated' && r.json.counts.deletedEntries === 1);
+  r = await call(app, 'POST', '/cache/request', {
+    url: 'https://origin.test/inv',
+    headers: { 'accept-encoding': 'gzip' },
+    virtualTime: T0,
+  });
+  check('gzip 变体已删除 => miss', r.json.state === 'miss');
+  r = await call(app, 'POST', '/cache/request', {
+    url: 'https://origin.test/inv',
+    headers: { 'accept-encoding': 'br' },
+    virtualTime: T0,
+  });
+  check('br 兄弟变体不受影响，仍命中', r.json.state === 'fresh' && r.json.response.body === 'br-body');
+
+  console.log('\n[17] 条件失效：释放该键 pending 回源令牌');
+  r = await call(app, 'POST', '/cache/request', {
+    url: 'https://origin.test/inv',
+    headers: { 'accept-encoding': 'br' },
+    virtualTime: T0 + 999 * minute,
+  });
+  check('br 变体过期，领队拿到 pending 令牌', r.json.token?.leader === true);
+  const invPendingToken = r.json.token.token;
+
+  // 正式执行前先 dryRun：应预览 would-delete / would-release 但不动任何数据
+  r = await call(app, 'POST', '/admin/invalidate', {
+    url: 'https://origin.test/inv',
+    requestHeaders: { 'accept-encoding': 'br' },
+    dryRun: true,
+  });
+  check('dryRun 显示 would-delete 与 would-release，实际不动数据',
+    r.json.outcome === 'preview' &&
+    r.json.affected[0].disposition === 'would-delete' &&
+    r.json.releasedTokens.some((t: any) => t.disposition === 'would-release' && t.token === invPendingToken) &&
+    r.json.counts.deletedEntries === 0 && r.json.counts.releasedTokens === 0);
+  r = await call(app, 'GET', '/cache/tokens?limit=5');
+  check('dryRun 后 pending 令牌仍然存在',
+    r.json.tokens.some((t: any) => t.token === invPendingToken && t.status === 'pending'));
+  r = await call(app, 'POST', '/cache/request', {
+    url: 'https://origin.test/inv',
+    headers: { 'accept-encoding': 'br' },
+    virtualTime: T0 + 999 * minute,
+  });
+  check('dryRun 后再来请求仍是加入者（令牌未被释放）', r.json.token?.leader === false &&
+    r.json.token.token === invPendingToken);
+
+  // 正式执行：删除 br 变体并在同一事务内释放 pending 令牌
+  r = await call(app, 'POST', '/admin/invalidate', {
+    url: 'https://origin.test/inv',
+    requestHeaders: { 'accept-encoding': 'br' },
+    reason: 'purge-brotli-variant',
+  });
+  check('正式失效删除 br 变体并释放 1 个 pending 令牌',
+    r.json.outcome === 'invalidated' && r.json.counts.deletedEntries === 1 &&
+    r.json.counts.releasedTokens === 1 &&
+    r.json.releasedTokens[0].token === invPendingToken &&
+    r.json.releasedTokens[0].disposition === 'released');
+  r = await call(app, 'GET', '/cache/tokens?all=1&limit=20');
+  check('被释放的令牌状态为 released',
+    r.json.tokens.some((t: any) => t.token === invPendingToken && t.status === 'released'));
+  r = await call(app, 'POST', '/cache/request', {
+    url: 'https://origin.test/inv',
+    headers: { 'accept-encoding': 'br' },
+    virtualTime: T0 + 999 * minute,
+  });
+  check('条目已删、令牌已释放 => miss 并签发全新令牌（领队）',
+    r.json.state === 'miss' && r.json.token?.leader === true &&
+    r.json.token.token !== invPendingToken);
+
+  console.log('\n[18] 条件失效：HEAD 映射、未知 URL 与参数校验');
+  await call(app, 'POST', '/admin/entries', {
+    url: 'https://origin.test/head-inv',
+    responseHeaders: { 'cache-control': 'max-age=60', etag: '"h1"' },
+    body: 'head-body',
+    storedAt: T0,
+  });
+  r = await call(app, 'POST', '/admin/invalidate', {
+    method: 'HEAD',
+    url: 'https://origin.test/head-inv',
+  });
+  check('HEAD 按 GET 键失效，target.keyMethod=GET', r.json.outcome === 'invalidated' &&
+    r.json.target.keyMethod === 'GET' && r.json.counts.deletedEntries === 1);
+  r = await call(app, 'POST', '/cache/request', {
+    method: 'HEAD',
+    url: 'https://origin.test/head-inv',
+    virtualTime: T0,
+  });
+  check('HEAD 失效后 miss', r.json.state === 'miss');
+
+  r = await call(app, 'POST', '/admin/invalidate', {
+    url: 'https://origin.test/no-such-resource',
+  });
+  check('未知 URL => 200 noop，affected/skipped 均为空',
+    r.status === 200 && r.json.outcome === 'noop' &&
+    r.json.affected.length === 0 && r.json.skipped.length === 0);
+
+  r = await call(app, 'POST', '/admin/invalidate', { requestHeaders: {} });
+  check('缺 url => 400', r.status === 400);
+  r = await call(app, 'POST', '/admin/invalidate', {
+    url: 'https://origin.test/inv',
+    dryRun: 'yes',
+  });
+  check('dryRun 非布尔 => 400', r.status === 400);
+  r = await call(app, 'POST', '/admin/invalidate', { url: 'ftp://origin.test/x' });
+  check('非 http(s) URL => 400', r.status === 400);
+
+  console.log('\n[19] 条件失效审计记录');
+  r = await call(app, 'GET', '/admin/invalidations?limit=100');
+  const records = r.json.invalidations;
+  check('审计记录可取（含正式与 dryRun）',
+    records.length >= 7 &&
+    records.some((x: any) => x.dryRun === true && x.outcome === 'preview') &&
+    records.some((x: any) => x.dryRun === false && x.outcome === 'invalidated') &&
+    records.some((x: any) => x.outcome === 'noop'));
+  const inv = records.find((x: any) => x.outcome === 'invalidated' && x.releasedTokenCount === 1);
+  check('审计记录可追溯：含请求头/受影响键/释放令牌/reason',
+    inv && inv.normalizedUrl === 'https://origin.test/inv' &&
+    inv.requestHeaders['accept-encoding'] === 'br' &&
+    inv.affected.length === 1 && inv.affected[0].etag === '"b1"' &&
+    inv.reason === 'purge-brotli-variant' &&
+    inv.releasedTokens[0] === invPendingToken);
+  r = await call(app, 'POST', '/admin/reset');
+  check('reset 清空失效记录', r.status === 200);
+  r = await call(app, 'GET', '/admin/invalidations');
+  check('reset 后审计记录为空', r.json.invalidations.length === 0);
+
   console.log(`\n结果：${passed} 通过，${failed} 失败`);
   await app.close();
   if (failed > 0) process.exit(1);

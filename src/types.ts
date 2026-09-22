@@ -103,3 +103,23 @@ export interface IssueTokenResult {
   /** true=本次请求是并发组里的领队（拿到令牌并负责提交回源结果） */
   leader: boolean;
 }
+
+/** invalidation_records 表行：一次条件失效操作的可追溯审计记录 */
+export interface InvalidationRecordRow {
+  id: number;
+  request_id: string;
+  dry_run: number; // 0/1
+  method: string;
+  normalized_url: string;
+  /** 本次请求用于解析 Vary 变体的请求头快照 JSON HeaderMap */
+  request_headers_json: string;
+  expected_etag: string | null;
+  reason: string | null;
+  outcome: string; // invalidated | preview | noop
+  affected_json: string; // JSON InvalidationAffected[]
+  skipped_json: string; // JSON InvalidationSkipped[]
+  released_tokens_json: string; // JSON string[]（完整令牌值）
+  deleted_entries: number;
+  released_token_count: number;
+  wall_time: number;
+}

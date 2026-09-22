@@ -11,9 +11,9 @@ export function generateToken(): string {
   return randomBytes(32).toString('base64url');
 }
 
-/** 生成请求 ID（未显式提供时） */
-export function generateRequestId(): string {
-  return 'req_' + randomBytes(8).toString('hex');
+/** 生成请求 ID（未显式提供时）。prefix 决定 ID 用途前缀，默认 req_ */
+export function generateRequestId(prefix = 'req'): string {
+  return prefix + '_' + randomBytes(8).toString('hex');
 }
 
 /**

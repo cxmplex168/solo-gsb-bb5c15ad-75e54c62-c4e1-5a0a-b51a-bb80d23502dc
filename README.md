@@ -5,6 +5,7 @@
 - 预置带 `Cache-Control`、`ETag`、`Vary` 与**存入时间**的模拟响应；
 - 携带**虚拟时间**发起请求，观察缓存按 `fresh` / `stale-while-revalidate` / `expired` 的判定；
 - 观察并发请求命中同一需回源键时的**单飞回源令牌**（single-flight token）编排；
+- 通过 `POST /admin/invalidate` 做**条件失效**：按方法、URL、请求头精确解析 Vary 变体，ETag 守卫，支持 `dryRun` 预览，事务内同时释放该键 pending 令牌；
 - 逐步核对每次判定输出的**解释轨迹**（trail）；
 - 一键重置整个演练状态。
 
@@ -31,6 +32,12 @@ curl -s http://localhost:8080/healthz
 docker compose down -v
 ```
 
+在一次性容器里跑完整端到端示例（内存库，80 项断言，跑完即退出，不触碰数据卷）：
+
+```bash
+docker compose --profile smoke run --build --rm smoke
+```
+
 ### 不用 Docker（本地开发）
 
 ```bash
@@ -38,7 +45,7 @@ npm ci
 npm run build
 DB_PATH=./data/lab.db npm start          # 生产模式
 DB_PATH=:memory: npm run dev             # 开发模式（内存库）
-npm run smoke                            # 51 项端到端断言
+npm run smoke                            # 80 项端到端断言
 ```
 
 环境变量：
@@ -197,7 +204,7 @@ Vary 变体查找：先按「方法 + 规范化 URL」筛候选条目，再用�
 - 提交 `status: 304` → 按 RFC 9111 合并：新响应头逐头覆盖旧头，body 与状态码沿用旧响应，`storedAt` 更新为 `originTime`；
 - 回源响应的 `Vary` 集合与缓存键不一致 → **409**（演练要求变体结构稳定）。
 
-等待方在领队提交后，**重新发起** `/cache/request`（带新的虚拟时间）即可看到新响应。若领队放弃回源，调用 `POST /cache/tokens/:token/release` 释放令牌，同键才能签发新令牌。
+等待方在领队提交后，**重新发起** `/cache/request`（带新的虚拟时间）即可看到新响应。令牌可由领队显式放弃（`POST /cache/tokens/:token/release`），也会在该键被 `POST /admin/invalidate` 条件失效时随删除事务一并释放——两种方式释放后，同键才能签发新令牌。
 
 ### 解释轨迹（trail）
 
@@ -222,6 +229,8 @@ Vary 变体查找：先按「方法 + 规范化 URL」筛候选条目，再用�
 | `GET` | `/cache/stats` | entries / pendingTokens / decisions 计数 |
 | `POST` | `/admin/entries` | 预置模拟响应 |
 | `DELETE` | `/admin/entries/:cacheKey` | 删除单个条目 |
+| `POST` | `/admin/invalidate` | 条件失效：方法 + URL + Vary 请求头精确定位，ETag 守卫，支持 `dryRun` |
+| `GET` | `/admin/invalidations?limit=100` | 条件失效审计记录（含 dryRun 预览记录） |
 | `POST` | `/admin/reset` | 清空全部数据并轮换实例 ID |
 | `GET` | `/healthz` | 健康检查 |
 
@@ -274,6 +283,88 @@ Vary 变体查找：先按「方法 + 规范化 URL」筛候选条目，再用�
 
 `responseHeaders` 与 `headers` 二者皆可（后者优先）；`body` 为字符串或 `null`。
 
+### `POST /admin/invalidate`
+
+按「方法 + 规范化 URL + 请求头」**精确解析 Vary 变体**后做条件失效：
+
+```json
+{
+  "method": "GET",
+  "url": "https://api.example.test/v?b=2&a=1",
+  "headers": { "accept-encoding": "br" },
+  "expectedEtag": "\"v2\"",
+  "dryRun": false,
+  "reason": "deploy-2026-01-02",
+  "requestId": "purge-job-42"
+}
+```
+
+- `method` 默认 `GET`；`HEAD` 与缓存请求一样映射到 `GET` 存储键（响应中以 `target.keyMethod` 体现）。
+- `headers` / `requestHeaders` 二者皆可，仅用于按各候选响应自身的 `Vary` 字段选择变体；URL 与键都按与普通请求完全相同的规则规范化。
+- `expectedEtag`（别名 `etag`）可选：**仅当目标条目的 ETag 与之逐字节相等时才删除**；裸值（`v2`）自动补双引号，`W/"…"` 弱校验值原样保留。条目不携带 ETag 时视为守卫失败。
+- `dryRun: true` 只解析与判定，不删条目、不动令牌；审计记录照常写入（`dryRun=true`），可事后追溯预览了什么。
+- `reason` / `requestId` 可选，便于把失效操作与发布单、作业 ID 串联。
+
+定位规则（与真实缓存「响应头决定键」一致）：
+
+1. 先按「方法 + 规范化 URL」筛候选条目；
+2. 用每个候选响应自己的 `Vary` 结合本次请求头算键——只有键哈希完全相等的**唯一一个**变体可能成为目标；
+3. 其他 Vary 变体进入 `skipped`，原因 `variant-not-selected`；
+4. 目标变体存在但 ETag 不符 → 进入 `skipped`，原因 `etag-mismatch`，**绝不删除任何条目**；
+5. 守卫通过 → 在单个 SQLite `IMMEDIATE` 事务内删除该条目，并把该键上的 **pending 回源令牌置为 `released`**（否则同键无法签发新令牌）。
+
+响应：
+
+```json
+{
+  "requestId": "inv_a1b2c3d4…",
+  "recordId": 7,
+  "dryRun": false,
+  "outcome": "invalidated",
+  "target": { "method": "GET", "normalizedUrl": "https://api.example.test/v?a=1&b=2", "requestHeaders": { "accept-encoding": "br" }, "expectedEtag": "\"v2\"" },
+  "affected": [
+    { "cacheKey": "9f8c…", "method": "GET", "normalizedUrl": "…", "etag": "\"v2\"",
+      "vary": ["accept-encoding"], "varySelectors": [{ "name": "accept-encoding", "value": "br" }],
+      "disposition": "deleted" }
+  ],
+  "skipped": [
+    { "cacheKey": "31aa…", "etag": "\"v2-gzip\"", "reason": "variant-not-selected", "detail": "该条目的 Vary(accept-encoding) 选择值对应另一个变体…" }
+  ],
+  "releasedTokens": [
+    { "token": "TWW1WGYUPd…", "tokenPrefix": "TWW1WGYUPd…", "etag": "\"v2\"", "disposition": "released" }
+  ],
+  "counts": { "deletedEntries": 1, "releasedTokens": 1 },
+  "recordEndpoint": "GET /admin/invalidations"
+}
+```
+
+- `outcome`：`invalidated`（正式删除）/ `preview`（dryRun 有待删项）/ `noop`（没有符合条件的条目，HTTP 状态仍为 200）。
+- dryRun 下 `disposition` 为 `would-delete` / `would-release`，`counts` 恒为 0。
+- `GET /admin/invalidations` 返回全部审计记录（最近在前），含定位材料、受影响键、跳过原因、释放的完整令牌值与墙上时间。
+
+快速演练（承接「30 秒上手」中的条目）：
+
+```bash
+# 先预览：确认会删哪个变体、会释放哪个令牌，不改动数据
+curl -s -X POST localhost:8080/admin/invalidate \
+  -H 'content-type: application/json' -d '{
+    "url": "https://api.example.test/feed",
+    "expectedEtag": "\"v1\"",
+    "dryRun": true
+  }'
+
+# 正式执行：ETag 相符才删，并释放该键 pending 回源令牌
+curl -s -X POST localhost:8080/admin/invalidate \
+  -H 'content-type: application/json' -d '{
+    "url": "https://api.example.test/feed",
+    "expectedEtag": "\"v1\"",
+    "reason": "hotfix-feed"
+  }'
+
+# 回看失效记录（dryRun 预览也在其中）
+curl -s 'localhost:8080/admin/invalidations?limit=20'
+```
+
 ---
 
 ## 演练剧本建议
@@ -284,6 +375,7 @@ Vary 变体查找：先按「方法 + 规范化 URL」筛候选条目，再用�
 4. **304 合并**：预置 `no-cache` + ETag 条目 → 拿到带 `If-None-Match` 的令牌 → 提交 304 与新 `max-age` → 验证 body 沿用、寿命更新。
 5. **Vary 变体**：预置同一 URL 的 `gzip` / `br` 两个变体，换请求头观察键材料与命中差异。
 6. **URL 规范化**：用乱序 query、大小写 host、默认端口、fragment 等形式请求同一资源，对比 `normalizedUrl` 与 `cacheKey`。
+7. **条件失效**：预置两个 Vary 变体后先 `dryRun` 预览（确认只选中一个变体），再用错误/正确的 `expectedEtag` 正式失效；在变体上制造一个 pending 回源令牌，观察失效事务同时释放令牌、之后同键请求能成为新领队；最后在 `/admin/invalidations` 核对审计记录。
 
 ---
 
@@ -305,7 +397,7 @@ src/
   canonical.ts      URL 规范化、Vary 解析、缓存键计算
   cache-control.ts  Cache-Control 指令解析（请求/响应共用）
   http-date.ts      IMF-fixdate / RFC850 / asctime 解析与格式化
-  db.ts             SQLite 表、条目写入、原子令牌签发与提交
+  db.ts             SQLite 表、条目写入、原子令牌签发与提交、条件失效事务与审计
   util.ts           时间/头/指纹等工具
-scripts/smoke.ts    端到端断言（51 项）
+scripts/smoke.ts    端到端断言（80 项）
 ```
