@@ -1,5 +1,10 @@
 import { FastifyInstance } from 'fastify';
-import { CacheStore, RevalidationConflictError } from './db';
+import {
+  CacheStore,
+  InvalidationSkip,
+  InvalidationTarget,
+  RevalidationConflictError,
+} from './db';
 import {
   computeCacheKey,
   normalizeUrl,
@@ -40,6 +45,17 @@ interface StoreEntryPayload {
   vary?: unknown;
 }
 
+interface InvalidatePayload {
+  method?: unknown;
+  url?: unknown;
+  /** 参与 Vary 变体选择的请求头 */
+  headers?: unknown;
+  /** 条件守卫：仅失效 ETag 相符的变体；缺省表示不按 ETag 限制 */
+  expectedEtag?: unknown;
+  dryRun?: unknown;
+  requestId?: unknown;
+}
+
 export default function registerRoutes(app: FastifyInstance, store: CacheStore): void {
   // —— 基础信息 ——
   app.get('/', async () => ({
@@ -57,6 +73,8 @@ export default function registerRoutes(app: FastifyInstance, store: CacheStore):
       'GET  /cache/stats': '计数',
       'POST /admin/entries': '预置模拟响应',
       'DELETE /admin/entries/:cacheKey': '删除单个条目',
+      'POST /admin/invalidate': '按方法+URL+请求头解析 Vary 变体并条件失效（支持 dryRun）',
+      'GET  /admin/invalidations': '失效操作记录（含 dryRun 预览）',
       'POST /admin/reset': '清空所有数据并重置实例',
       'GET  /healthz': '健康检查',
     },
@@ -494,6 +512,167 @@ export default function registerRoutes(app: FastifyInstance, store: CacheStore):
     return reply.code(200).send({ deleted: true, cacheKey });
   });
 
+  // —— 条件失效（按方法 + URL + 请求头精确解析 Vary 变体）——
+  app.post('/admin/invalidate', async (req, reply) => {
+    const body = (req.body ?? {}) as InvalidatePayload;
+
+    const method = (asOptionalString(body.method, 'method') ?? 'GET').toUpperCase();
+    if (!/^[A-Z]+$/.test(method)) throw new ValidationError('method 必须是 HTTP 方法 token');
+    // 与 /cache/request 一致：HEAD 与 GET 共享缓存键空间
+    const keyMethod = method === 'HEAD' ? 'GET' : method;
+
+    const url = asRequiredString(body.url, 'url');
+    const normalized = normalizeUrl(url);
+    const requestHeaders = normalizeHeaders(body.headers);
+    const requestId =
+      asOptionalString(body.requestId, 'requestId') ?? generateRequestId();
+    const dryRun = body.dryRun === undefined ? false : asBoolean(body.dryRun, 'dryRun');
+
+    // 条件守卫：expectedEtag 缺省时不按 ETag 限制
+    let expectedEtag: string | null = null;
+    const rawEtag = asOptionalString(body.expectedEtag, 'expectedEtag');
+    if (rawEtag !== undefined) {
+      expectedEtag =
+        rawEtag.startsWith('"') || rawEtag.startsWith('W/') ? rawEtag : `"${rawEtag}"`;
+    }
+
+    // 与 lookupEntry 相同的「响应头决定键」解析：先按方法+规范化 URL 取候选，
+    // 再用每个候选自身的 Vary 集合结合本次请求头精确计算键。
+    const candidates = store
+      .listEntries(500)
+      .filter((e) => e.method === keyMethod && e.normalized_url === normalized.normalized);
+
+    const targets: InvalidationTarget[] = [];
+    const skipped: InvalidationSkip[] = [];
+    const candidateDetails: Array<{
+      cacheKey: string;
+      vary: string[];
+      requestedKey: string;
+      match: boolean;
+      etag: string | null;
+    }> = [];
+
+    for (const candidate of candidates) {
+      const varyNames = JSON.parse(candidate.vary_names) as string[];
+      const varySelectors = selectVaryHeaders(varyNames, requestHeaders);
+      const keyDetails = computeCacheKey({
+        method: keyMethod,
+        normalizedUrl: normalized.normalized,
+        varyNames,
+        varySelectors,
+      });
+      const actualEtag = (JSON.parse(candidate.response_headers) as HeaderMap)['etag'] ?? null;
+      const match = keyDetails.cacheKey === candidate.cache_key;
+      candidateDetails.push({
+        cacheKey: candidate.cache_key,
+        vary: varyNames,
+        requestedKey: keyDetails.cacheKey,
+        match,
+        etag: actualEtag,
+      });
+
+      if (!match) {
+        skipped.push({
+          reason: 'variant-miss',
+          detail: `候选条目 Vary(${varyNames.join(',') || '∅'}) 的选择值与本次请求头不一致，不属于被失效的变体`,
+          normalizedUrl: normalized.normalized,
+          method: keyMethod,
+          candidateCacheKey: candidate.cache_key,
+          requestedKey: keyDetails.cacheKey,
+          varyNames,
+          varySelectors,
+        });
+        continue;
+      }
+
+      // 事务内会再做一次 ETag 复核；这里先按计划快照给出跳过项，便于解释
+      if (expectedEtag !== null && actualEtag !== expectedEtag) {
+        skipped.push({
+          reason: 'etag-mismatch',
+          detail: `变体命中但 ETag 不符：条目当前为 ${actualEtag ?? '∅'}，期望 ${expectedEtag}，按条件守卫跳过`,
+          normalizedUrl: normalized.normalized,
+          method: keyMethod,
+          cacheKey: candidate.cache_key,
+          varyNames,
+          varySelectors,
+          expectedEtag,
+          actualEtag,
+        });
+        continue;
+      }
+
+      targets.push({
+        cacheKey: candidate.cache_key,
+        method: keyMethod,
+        normalizedUrl: normalized.normalized,
+        varyNames,
+        varySelectors,
+        expectedEtag,
+        actualEtag,
+      });
+    }
+
+    if (candidates.length === 0) {
+      skipped.push({
+        reason: 'no-candidate',
+        detail: `方法 ${keyMethod} + 规范化 URL ${normalized.normalized} 下没有任何缓存条目`,
+        normalizedUrl: normalized.normalized,
+        method: keyMethod,
+      });
+    }
+
+    const result = store.invalidate({
+      requestId,
+      dryRun,
+      method,
+      keyMethod,
+      url,
+      normalizedUrl: normalized.normalized,
+      expectedEtag,
+      targets,
+      skipped,
+      now: Date.now(),
+    });
+
+    return reply.code(dryRun ? 200 : 201).send({
+      recordId: result.id,
+      requestId: result.requestId,
+      dryRun,
+      method,
+      keyMethod,
+      url,
+      normalizedUrl: normalized.normalized,
+      expectedEtag,
+      requestHeaders,
+      candidates: candidateDetails,
+      targets: result.targets,
+      matchedKeys: result.targets.map((t) => t.cacheKey),
+      // 实际影响：dryRun 恒为空（不产生副作用）
+      affectedKeys: result.affectedKeys,
+      deleted: result.deleted,
+      releasedTokens: result.releasedTokens,
+      // dryRun 预览：执行时将发生的动作
+      ...(dryRun
+        ? {
+            wouldAffectKeys: result.wouldAffectKeys,
+            wouldReleaseTokens: result.wouldReleaseTokens,
+          }
+        : {}),
+      skipped: result.skipped,
+      skipSummary: summarizeSkips(result.skipped),
+      stats: store.stats(),
+      recordsEndpoint: 'GET /admin/invalidations',
+      message: dryRun
+        ? `dryRun 预览：将删除 ${result.wouldAffectKeys.length} 个条目、释放 ${result.wouldReleaseTokens.length} 个 pending 令牌；未做任何修改（预览已留痕 #${result.id}）`
+        : `已删除 ${result.deleted.length} 个条目、释放 ${result.releasedTokens.length} 个 pending 回源令牌；失效记录 #${result.id}`,
+    });
+  });
+
+  app.get('/admin/invalidations', async (req) => {
+    const q = req.query as { limit?: string };
+    return { invalidations: store.listInvalidationLogs(clampLimit(q.limit)) };
+  });
+
   // —— 重置 ——
   app.post('/admin/reset', async () => {
     store.reset();
@@ -655,6 +834,20 @@ function asOptionalString(value: unknown, field: string): string | undefined {
   if (value === undefined || value === null) return undefined;
   if (typeof value !== 'string') throw new ValidationError(`${field} 必须是字符串`);
   return value;
+}
+
+function asBoolean(value: unknown, field: string): boolean {
+  if (typeof value !== 'boolean') throw new ValidationError(`${field} 必须是布尔值`);
+  return value;
+}
+
+/** 按原因聚合计数跳过项，便于一眼看出各变体被跳过的原因 */
+function summarizeSkips(skipped: InvalidationSkip[]): Record<string, number> {
+  const summary: Record<string, number> = {};
+  for (const s of skipped) {
+    summary[s.reason] = (summary[s.reason] ?? 0) + 1;
+  }
+  return summary;
 }
 
 function asStatus(value: unknown): number {

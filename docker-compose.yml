@@ -26,5 +26,18 @@ services:
       retries: 5
       start_period: 5s
 
+  # 一次性的容器内端到端断言（含条件失效场景），不发布端口：
+  #   docker compose run --build smoke
+  smoke:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: http-cache-lab:latest
+    profiles: ["smoke"]
+    environment:
+      LOG_LEVEL: error
+    command: ["node", "dist/scripts/smoke.js"]
+    restart: "no"
+
 volumes:
   cache-lab-data:

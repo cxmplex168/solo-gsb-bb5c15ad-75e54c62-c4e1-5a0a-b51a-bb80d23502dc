@@ -325,6 +325,7 @@ async function main(): Promise<void> {
   console.log('\n[13] 重置端点');
   r = await call(app, 'POST', '/admin/reset');
   check('reset 200 且计数归零', r.status === 200 && r.json.stats.entries === 0 && r.json.stats.pendingTokens === 0);
+  check('reset 同时清空失效记录', r.json.stats.invalidations === 0, r.json.stats);
   r = await call(app, 'POST', '/cache/request', { url: 'https://origin.test/a', virtualTime: T0 });
   check('重置后旧键 miss', r.json.state === 'miss');
 
@@ -339,6 +340,142 @@ async function main(): Promise<void> {
     responseHeaders: { vary: '*' },
   });
   check('Vary: * 预置被拒', r.status === 400);
+
+  console.log('\n[15] 条件失效：Vary 精确解析 / ETag 守卫 / dryRun / 令牌释放');
+  await call(app, 'POST', '/admin/entries', {
+    url: 'https://origin.test/inv',
+    requestHeaders: { 'accept-encoding': 'gzip' },
+    responseHeaders: { 'cache-control': 'max-age=600', etag: '"g1"', vary: 'Accept-Encoding' },
+    body: 'gzip-v1',
+    storedAt: T0,
+  });
+  await call(app, 'POST', '/admin/entries', {
+    url: 'https://origin.test/inv',
+    requestHeaders: { 'accept-encoding': 'br' },
+    responseHeaders: { 'cache-control': 'max-age=600', etag: '"b1"', vary: 'Accept-Encoding' },
+    body: 'br-v1',
+    storedAt: T0,
+  });
+
+  // dryRun：只预览，不动数据
+  r = await call(app, 'POST', '/admin/invalidate', {
+    url: 'https://origin.test/inv',
+    headers: { 'accept-encoding': 'gzip' },
+    dryRun: true,
+  });
+  check('dryRun 返回 200', r.status === 200);
+  check('dryRun 预览 1 个将删除键', r.json.wouldAffectKeys.length === 1 && r.json.affectedKeys.length === 0);
+  check('dryRun 被跳过的是 br 变体（variant-miss）', r.json.skipSummary['variant-miss'] === 1);
+  check('dryRun 实际 deleted 为空', r.json.deleted.length === 0);
+  let stats = (await call(app, 'GET', '/cache/stats')).json;
+  check('dryRun 后条目仍在（entries=2）', stats.entries === 2);
+  check('dryRun 也留下可追溯记录', stats.invalidations === 1);
+  let req = await call(app, 'POST', '/cache/request', {
+    url: 'https://origin.test/inv',
+    headers: { 'accept-encoding': 'gzip' },
+    virtualTime: T0,
+  });
+  check('dryRun 不影响缓存：gzip 变体仍 fresh', req.json.state === 'fresh');
+
+  // ETag 守卫：不符则跳过
+  r = await call(app, 'POST', '/admin/invalidate', {
+    url: 'https://origin.test/inv',
+    headers: { 'accept-encoding': 'gzip' },
+    expectedEtag: '"stale-etag"',
+  });
+  check('ETag 不符：affectedKeys 为空', r.status === 201 && r.json.affectedKeys.length === 0);
+  check('跳过原因为 etag-mismatch', r.json.skipSummary['etag-mismatch'] === 1);
+  check('跳过项携带期望/实际 ETag', r.json.skipped.some((s: any) =>
+    s.reason === 'etag-mismatch' && s.expectedEtag === '"stale-etag"' && s.actualEtag === '"g1"'));
+  req = await call(app, 'POST', '/cache/request', {
+    url: 'https://origin.test/inv',
+    headers: { 'accept-encoding': 'gzip' },
+    virtualTime: T0,
+  });
+  check('ETag 守卫拦下后条目仍可命中', req.json.state === 'fresh');
+
+  // 失效前让该键进入回源：预置一个已过期条目并制造 pending 令牌
+  await call(app, 'POST', '/admin/entries', {
+    url: 'https://origin.test/pending',
+    responseHeaders: { 'cache-control': 'max-age=0', etag: '"p1"' },
+    body: 'p-body',
+    storedAt: T0,
+  });
+  req = await call(app, 'POST', '/cache/request', {
+    url: 'https://origin.test/pending',
+    virtualTime: T0 + 999 * minute,
+  });
+  check('过期请求拿到 pending 令牌', req.json.action === 'must-revalidate' && req.json.token.leader === true);
+  const pendingToken = req.json.token.token;
+
+  // 正式执行：ETag 相符，删条目并释放 pending 令牌
+  r = await call(app, 'POST', '/admin/invalidate', {
+    url: 'https://origin.test/pending',
+    expectedEtag: 'p1', // 不带引号，自动补成 "p1"
+  });
+  check('expectedEtag 裸值自动补引号', r.json.expectedEtag === '"p1"');
+  check('正式失效返回 201 且 affectedKeys=1', r.status === 201 && r.json.affectedKeys.length === 1);
+  check('返回被删键与实际 ETag', r.json.deleted[0].etag === '"p1"');
+  check('pending 回源令牌被释放', r.json.releasedTokens.length === 1 && r.json.releasedTokens[0].token === pendingToken);
+  let tr = await call(app, 'GET', '/cache/tokens?all=1');
+  check('令牌状态变为 released', tr.json.tokens.some((t: any) => t.token === pendingToken && t.status === 'released'));
+  req = await call(app, 'POST', '/cache/request', {
+    url: 'https://origin.test/pending',
+    virtualTime: T0 + 999 * minute,
+  });
+  check('条目已失效 => miss 并签发新令牌（单飞槽位已释放）',
+    req.json.state === 'miss' && req.json.token.leader === true && req.json.token.token !== pendingToken);
+
+  // 正式失效只动目标变体，兄弟变体保留
+  r = await call(app, 'POST', '/admin/invalidate', {
+    url: 'https://origin.test/inv',
+    headers: { 'accept-encoding': 'gzip' },
+    expectedEtag: '"g1"',
+  });
+  check('精确失效 gzip 变体', r.json.affectedKeys.length === 1 && r.json.skipSummary['variant-miss'] === 1);
+  req = await call(app, 'POST', '/cache/request', {
+    url: 'https://origin.test/inv',
+    headers: { 'accept-encoding': 'gzip' },
+    virtualTime: T0,
+  });
+  check('gzip 变体已删除 => miss', req.json.state === 'miss');
+  req = await call(app, 'POST', '/cache/request', {
+    url: 'https://origin.test/inv',
+    headers: { 'accept-encoding': 'br' },
+    virtualTime: T0,
+  });
+  check('br 变体不受影响，仍 fresh', req.json.state === 'fresh' && req.json.response.body === 'br-v1');
+
+  // HEAD 映射 GET 键空间
+  r = await call(app, 'POST', '/admin/invalidate', {
+    method: 'HEAD',
+    url: 'https://origin.test/inv',
+    headers: { 'accept-encoding': 'br' },
+    expectedEtag: '"b1"',
+  });
+  check('HEAD 失效映射到 GET 变体并删除', r.json.keyMethod === 'GET' && r.json.affectedKeys.length === 1);
+
+  // 不存在 / 无头匹配 / 重复失效
+  r = await call(app, 'POST', '/admin/invalidate', { url: 'https://origin.test/nope' });
+  check('无候选：no-candidate 跳过且无影响', r.json.affectedKeys.length === 0 && r.json.skipSummary['no-candidate'] === 1);
+  r = await call(app, 'POST', '/admin/invalidate', { url: 'https://origin.test/pending' });
+  check('对已删键重复失效：no-candidate', r.json.skipSummary['no-candidate'] === 1 && r.json.affectedKeys.length === 0);
+
+  // 记录查询
+  r = await call(app, 'GET', '/admin/invalidations?limit=100');
+  check('失效记录可取（含此前全部操作）', Array.isArray(r.json.invalidations) && r.json.invalidations.length >= 5);
+  check('记录含 dryRun 标记与 skipped 明细', r.json.invalidations.some((l: any) =>
+    l.dryRun === true && Array.isArray(l.skipped)));
+  stats = (await call(app, 'GET', '/cache/stats')).json;
+  check('stats 含 invalidations 计数', stats.invalidations >= 5);
+
+  // 入参校验
+  r = await call(app, 'POST', '/admin/invalidate', { headers: {}, dryRun: true });
+  check('缺 url => 400', r.status === 400);
+  r = await call(app, 'POST', '/admin/invalidate', { url: 'https://origin.test/inv', dryRun: 'yes' });
+  check('dryRun 非布尔 => 400', r.status === 400);
+  r = await call(app, 'POST', '/admin/invalidate', { url: 'bad-url' });
+  check('坏 URL => 400', r.status === 400);
 
   console.log(`\n结果：${passed} 通过，${failed} 失败`);
   await app.close();

@@ -6,6 +6,7 @@
 - 携带**虚拟时间**发起请求，观察缓存按 `fresh` / `stale-while-revalidate` / `expired` 的判定；
 - 观察并发请求命中同一需回源键时的**单飞回源令牌**（single-flight token）编排；
 - 逐步核对每次判定输出的**解释轨迹**（trail）；
+- 按方法 + URL + 请求头**精确解析 Vary 变体**做**条件失效**（ETag 守卫、dryRun 预览、释放 pending 令牌、全程留痕）；
 - 一键重置整个演练状态。
 
 技术栈：TypeScript · Fastify 4 · better-sqlite3（同步驱动，天然避免回源竞态）。
@@ -22,13 +23,19 @@ docker compose up --build
 
 ```bash
 curl -s http://localhost:8080/healthz
-# {"ok":true,"stats":{"entries":0,"pendingTokens":0,"decisions":0}}
+# {"ok":true,"stats":{"entries":0,"pendingTokens":0,"decisions":0,"invalidations":0}}
 ```
 
 停止并清空数据卷：
 
 ```bash
 docker compose down -v
+```
+
+在容器内运行端到端断言（内存库、随建随跑，含条件失效场景）：
+
+```bash
+docker compose run --build smoke
 ```
 
 ### 不用 Docker（本地开发）
@@ -38,7 +45,7 @@ npm ci
 npm run build
 DB_PATH=./data/lab.db npm start          # 生产模式
 DB_PATH=:memory: npm run dev             # 开发模式（内存库）
-npm run smoke                            # 51 项端到端断言
+npm run smoke                            # 84 项端到端断言
 ```
 
 环境变量：
@@ -126,6 +133,76 @@ curl -s -X POST localhost:8080/cache/revalidate \
     "headers": { "cache-control": "max-age=120", "etag": "\"v2\"" },
     "originTime": '$((T0+75000))'
   }'
+```
+
+---
+
+## 端到端示例：条件失效一个 Vary 变体
+
+假设有源站在推送配置后要求缓存**只作废 gzip 的 v1 变体**，且必须确认作废的确实是 v1（防止回源已写入 v2 后误删）：
+
+```bash
+T0=1767225600000
+
+# 1) 预置同 URL 的两个 Vary 变体（ETag 不同）
+curl -s -X POST localhost:8080/admin/entries -H 'content-type: application/json' -d '{
+  "url": "https://api.example.test/cfg",
+  "requestHeaders": { "accept-encoding": "gzip" },
+  "responseHeaders": { "cache-control": "max-age=3600", "etag": "\"v1\"", "vary": "Accept-Encoding" },
+  "body": "cfg-gzip-v1", "storedAt": '$T0'
+}' >/dev/null
+curl -s -X POST localhost:8080/admin/entries -H 'content-type: application/json' -d '{
+  "url": "https://api.example.test/cfg",
+  "requestHeaders": { "accept-encoding": "br" },
+  "responseHeaders": { "cache-control": "max-age=3600", "etag": "\"v1\"", "vary": "Accept-Encoding" },
+  "body": "cfg-br-v1", "storedAt": '$T0'
+}' >/dev/null
+
+# 2) 旧副本过期，领队已拿到 pending 回源令牌（失效时应一并释放）
+curl -s -X POST localhost:8080/cache/request -H 'content-type: application/json' -d '{
+  "url": "https://api.example.test/cfg",
+  "headers": { "accept-encoding": "gzip" },
+  "virtualTime": '$((T0+9999000))'
+}' >/dev/null
+
+# 3) dryRun 预览：wouldAffectKeys 只有 gzip 变体；br 在 skipped(variant-miss)
+curl -s -X POST localhost:8080/admin/invalidate -H 'content-type: application/json' -d '{
+  "url": "https://api.example.test/cfg",
+  "headers": { "accept-encoding": "gzip" },
+  "expectedEtag": "\"v1\"", "dryRun": true
+}'
+
+# 4) 错误的 ETag 守卫：什么都不删（etag-mismatch）
+curl -s -X POST localhost:8080/admin/invalidate -H 'content-type: application/json' -d '{
+  "url": "https://api.example.test/cfg",
+  "headers": { "accept-encoding": "gzip" },
+  "expectedEtag": "\"v9\""
+}'
+
+# 5) 正式执行：删除 gzip v1 条目，并释放该键 pending 回源令牌
+curl -s -X POST localhost:8080/admin/invalidate -H 'content-type: application/json' -d '{
+  "url": "https://api.example.test/cfg",
+  "headers": { "accept-encoding": "gzip" },
+  "expectedEtag": "\"v1\""
+}'
+# {"recordId":3,"dryRun":false,"affectedKeys":["<sha256>"],
+#  "deleted":[{"cacheKey":"…","etag":"\"v1\""}],
+#  "releasedTokens":[{"token":"…","cacheKey":"…",...}], ...}
+
+# 6) 验证：gzip 已 miss（可重新回源），br 兄弟变体仍 fresh
+curl -s -X POST localhost:8080/cache/request -H 'content-type: application/json' -d '{
+  "url": "https://api.example.test/cfg",
+  "headers": { "accept-encoding": "gzip" }, "virtualTime": '$T0'
+}' | grep -o '"state":"[a-z-]*"'
+# "state":"miss"
+curl -s -X POST localhost:8080/cache/request -H 'content-type: application/json' -d '{
+  "url": "https://api.example.test/cfg",
+  "headers": { "accept-encoding": "br" }, "virtualTime": '$T0'
+}' | grep -o '"state":"[a-z-]*"'
+# "state":"fresh"
+
+# 7) 追溯：dryRun 预览与正式执行都在记录里
+curl -s 'localhost:8080/admin/invalidations?limit=10'
 ```
 
 ---
@@ -222,6 +299,8 @@ Vary 变体查找：先按「方法 + 规范化 URL」筛候选条目，再用�
 | `GET` | `/cache/stats` | entries / pendingTokens / decisions 计数 |
 | `POST` | `/admin/entries` | 预置模拟响应 |
 | `DELETE` | `/admin/entries/:cacheKey` | 删除单个条目 |
+| `POST` | `/admin/invalidate` | 条件失效（Vary 精确解析 + ETag 守卫 + dryRun） |
+| `GET` | `/admin/invalidations?limit=100` | 失效操作记录（含 dryRun 预览记录） |
 | `POST` | `/admin/reset` | 清空全部数据并轮换实例 ID |
 | `GET` | `/healthz` | 健康检查 |
 
@@ -274,6 +353,75 @@ Vary 变体查找：先按「方法 + 规范化 URL」筛候选条目，再用�
 
 `responseHeaders` 与 `headers` 二者皆可（后者优先）；`body` 为字符串或 `null`。
 
+### `POST /admin/invalidate`
+
+按「方法 + 规范化 URL + 请求头」**精确解析 Vary 变体**后做条件失效。变体解析规则与 `/cache/request` 完全一致：先按方法 + 规范化 URL 取候选，再用候选**响应自身的 `Vary`** 结合本次 `headers` 计算缓存键——因此只会失效请求头真正选中的那个变体，同 URL 的兄弟变体不动。
+
+```json
+{
+  "method": "GET",
+  "url": "https://api.example.test/v?z=1&a=2",
+  "headers": { "accept-encoding": "gzip" },
+  "expectedEtag": "\"v1\"",
+  "dryRun": false,
+  "requestId": "my-invalidation-id"
+}
+```
+
+- `method` 默认 `GET`；`HEAD` 与 `/cache/request` 一样映射到 `GET` 键空间（响应中以 `keyMethod` 体现）。
+- `headers`：参与 Vary 选择的请求头（头名大小写不敏感，规则同缓存请求）。
+- `expectedEtag`：**条件守卫，可省略**。给出时仅删除条目当前 ETag 与之**精确相等**的键；裸值（`v1`）自动补引号（`"v1"`），带 `W/` 前缀则原样使用。省略表示不按 ETag 限制。
+- `dryRun: true`：只做解析与预览，**不删除、不放令牌**；预览同样写入失效记录（`dryRun: true`），便于审计「谁在什么时候预览过什么」。
+
+执行（非 dryRun）在**单个 SQLite `IMMEDIATE` 事务**内完成：
+
+1. 对每个变体命中的目标键再次读取条目，仅当 ETag 与 `expectedEtag` 相符才 `DELETE`（计划与执行之间条目被回源覆盖时不会误删新内容）；
+2. 每删除一个键，**释放该键的 pending 回源令牌**（置 `released`），之后该键的请求可以重新签发令牌；非 pending（consumed/released）令牌不动；
+3. 写入 `invalidation_logs` 记录。
+
+响应字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `recordId` | 失效记录 ID，可用 `GET /admin/invalidations` 回看 |
+| `targets` / `matchedKeys` | Vary 变体命中的目标键（含键材料选择值、实际 ETag） |
+| `affectedKeys` / `deleted` | **实际**删除的键与 ETag（dryRun 恒为空数组） |
+| `releasedTokens` | **实际**释放的 pending 令牌（dryRun 恒为空） |
+| `wouldAffectKeys` / `wouldReleaseTokens` | 仅 dryRun：执行时将删除/将释放的预览 |
+| `skipped` | 逐个候选/目标键的跳过明细（含 Vary 选择值、期望/实际 ETag） |
+| `skipSummary` | 按跳过原因聚合计数 |
+
+跳过原因（`skipped[].reason`）：
+
+- `no-candidate`：方法 + 规范化 URL 下没有任何条目；
+- `variant-miss`：同 URL 存在其他 Vary 变体，但按本次请求头算出的键不匹配（**不属于被失效的变体**，原样保留）；
+- `etag-mismatch`：变体命中，但条目当前 ETag 与 `expectedEtag` 不符（计划阶段或事务内复核发现，均跳过）；
+- `entry-vanished`：计划后、事务执行前条目已被并发移除。
+
+示例（dryRun 预览 → 确认后执行）：
+
+```bash
+# 1) 预览：只会失效 gzip 变体，br 变体出现在 skipped(variant-miss)
+curl -s -X POST localhost:8080/admin/invalidate \
+  -H 'content-type: application/json' -d '{
+    "url": "https://api.example.test/v",
+    "headers": { "accept-encoding": "gzip" },
+    "expectedEtag": "\"v1\"",
+    "dryRun": true
+  }'
+
+# 2) 确认无误后去掉 dryRun 正式执行
+curl -s -X POST localhost:8080/admin/invalidate \
+  -H 'content-type: application/json' -d '{
+    "url": "https://api.example.test/v",
+    "headers": { "accept-encoding": "gzip" },
+    "expectedEtag": "\"v1\""
+  }'
+
+# 3) 回看全部失效记录（含 dryRun）
+curl -s 'localhost:8080/admin/invalidations?limit=20'
+```
+
 ---
 
 ## 演练剧本建议
@@ -284,6 +432,7 @@ Vary 变体查找：先按「方法 + 规范化 URL」筛候选条目，再用�
 4. **304 合并**：预置 `no-cache` + ETag 条目 → 拿到带 `If-None-Match` 的令牌 → 提交 304 与新 `max-age` → 验证 body 沿用、寿命更新。
 5. **Vary 变体**：预置同一 URL 的 `gzip` / `br` 两个变体，换请求头观察键材料与命中差异。
 6. **URL 规范化**：用乱序 query、大小写 host、默认端口、fragment 等形式请求同一资源，对比 `normalizedUrl` 与 `cacheKey`。
+7. **条件失效**：预置 `gzip` / `br` 两个 ETag 不同的变体 → 先 `dryRun` 确认只选中 gzip 且 br 出现在 `variant-miss` → 用错误的 `expectedEtag` 执行被 `etag-mismatch` 拦下 → 用正确 ETag 执行后确认 gzip 删除、br 仍命中、pending 令牌被释放。
 
 ---
 
@@ -305,7 +454,7 @@ src/
   canonical.ts      URL 规范化、Vary 解析、缓存键计算
   cache-control.ts  Cache-Control 指令解析（请求/响应共用）
   http-date.ts      IMF-fixdate / RFC850 / asctime 解析与格式化
-  db.ts             SQLite 表、条目写入、原子令牌签发与提交
+  db.ts             SQLite 表、条目写入、原子令牌签发与提交、条件失效事务
   util.ts           时间/头/指纹等工具
-scripts/smoke.ts    端到端断言（51 项）
+scripts/smoke.ts    端到端断言（84 项）
 ```
